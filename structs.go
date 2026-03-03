@@ -20,6 +20,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/disgoorg/godave"
 	"github.com/gorilla/websocket"
 )
 
@@ -89,6 +90,12 @@ type Session struct {
 
 	// Stores a mapping of guild id's to VoiceConnections
 	VoiceConnections map[string]*VoiceConnection
+
+	// DAVESessionCreateFunc is an optional function used to create a DAVE session for
+	// voice connections. When nil, a no-op DAVE session is used. To enable real end-to-end
+	// encryption, set this to a function that returns a godave.Session implementation
+	// (e.g. golibdave.NewSession from github.com/disgoorg/godave/golibdave).
+	DAVESessionCreateFunc godave.SessionCreateFunc
 
 	// Managed state object, updated internally with events when
 	// StateEnabled is true.

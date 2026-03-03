@@ -18,6 +18,7 @@ import (
 	"runtime"
 	"time"
 
+	"github.com/disgoorg/godave"
 	"github.com/gorilla/websocket"
 )
 
@@ -59,6 +60,9 @@ func New(token string) (s *Session, err error) {
 	s.Identify.Intents = IntentsAllWithoutPrivileged
 	s.Identify.Token = token
 	s.Token = token
+
+	// Default to no-op DAVE session; replace with golibdave.NewSession for real E2EE.
+	s.DAVESessionCreateFunc = godave.NewNoopSession
 
 	return
 }
