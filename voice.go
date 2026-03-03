@@ -15,12 +15,14 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/disgoorg/godave"
 	"github.com/gorilla/websocket"
 )
 
@@ -69,6 +71,11 @@ type VoiceConnection struct {
 
 	op4 voiceOP4
 	op2 voiceOP2
+
+	// dave is the DAVE end-to-end encryption session for this voice connection.
+	dave godave.Session
+	// daveSSRCToUserID maps SSRC values to Discord user IDs for DAVE frame decryption.
+	daveSSRCToUserID map[uint32]string
 
 	voiceSpeakingUpdateHandlers []VoiceSpeakingUpdateHandler
 }
@@ -238,8 +245,9 @@ type VoiceSpeakingUpdate struct {
 // A voiceOP4 stores the data for the voice operation 4 websocket event
 // which provides us with the NaCl SecretBox encryption key
 type voiceOP4 struct {
-	SecretKey [32]byte `json:"secret_key"`
-	Mode      string   `json:"mode"`
+	SecretKey           [32]byte `json:"secret_key"`
+	Mode                string   `json:"mode"`
+	DAVEProtocolVersion uint16   `json:"dave_protocol_version"`
 }
 
 // A voiceOP2 stores the data for the voice operation 2 websocket event
@@ -319,17 +327,32 @@ func (v *VoiceConnection) open() (err error) {
 		return
 	}
 
+	// Initialise the DAVE end-to-end encryption session.
+	createFunc := v.session.DAVESessionCreateFunc
+	if createFunc == nil {
+		createFunc = godave.NewNoopSession
+	}
+	userID := v.UserID
+	if userID == "" && v.session.State != nil && v.session.State.User != nil {
+		userID = v.session.State.User.ID
+	}
+	v.daveSSRCToUserID = make(map[uint32]string)
+	v.dave = createFunc(slog.Default(), godave.UserID(userID), v)
+	channelIDUint, _ := strconv.ParseUint(v.ChannelID, 10, 64)
+	v.dave.SetChannelID(godave.ChannelID(channelIDUint))
+
 	type voiceHandshakeData struct {
-		ServerID  string `json:"server_id"`
-		UserID    string `json:"user_id"`
-		SessionID string `json:"session_id"`
-		Token     string `json:"token"`
+		ServerID               string `json:"server_id"`
+		UserID                 string `json:"user_id"`
+		SessionID              string `json:"session_id"`
+		Token                  string `json:"token"`
+		MaxDAVEProtocolVersion int    `json:"max_dave_protocol_version"`
 	}
 	type voiceHandshakeOp struct {
 		Op   int                `json:"op"` // Always 0
 		Data voiceHandshakeData `json:"d"`
 	}
-	data := voiceHandshakeOp{0, voiceHandshakeData{v.GuildID, v.UserID, v.sessionID, v.token}}
+	data := voiceHandshakeOp{0, voiceHandshakeData{v.GuildID, v.UserID, v.sessionID, v.token, v.dave.MaxSupportedProtocolVersion()}}
 
 	v.wsMutex.Lock()
 	err = v.wsConn.WriteJSON(data)
@@ -356,7 +379,7 @@ func (v *VoiceConnection) wsListen(wsConn *websocket.Conn, close <-chan struct{}
 	v.log(LogInformational, "called")
 
 	for {
-		_, message, err := v.wsConn.ReadMessage()
+		msgType, message, err := v.wsConn.ReadMessage()
 		if err != nil {
 			// 4014 indicates a manual disconnection by someone in the guild;
 			// we shouldn't reconnect.
@@ -417,7 +440,11 @@ func (v *VoiceConnection) wsListen(wsConn *websocket.Conn, close <-chan struct{}
 		case <-close:
 			return
 		default:
-			go v.onEvent(message)
+			if msgType == websocket.BinaryMessage {
+				go v.onBinaryEvent(message)
+			} else {
+				go v.onEvent(message)
+			}
 		}
 	}
 }
@@ -492,22 +519,86 @@ func (v *VoiceConnection) onEvent(message []byte) {
 		block, _ := aes.NewCipher(v.op4.SecretKey[:])
 		v.aead, _ = cipher.NewGCM(block)
 
+		// Notify the DAVE session of the negotiated protocol version.
+		v.dave.OnSelectProtocolAck(v.op4.DAVEProtocolVersion)
+
 		return
 
 	case 5:
-		if len(v.voiceSpeakingUpdateHandlers) == 0 {
-			return
-		}
-
 		voiceSpeakingUpdate := &VoiceSpeakingUpdate{}
 		if err := json.Unmarshal(e.RawData, voiceSpeakingUpdate); err != nil {
 			v.log(LogError, "OP5 unmarshall error, %s, %s", err, string(e.RawData))
 			return
 		}
 
+		// Record the SSRC → UserID mapping used for DAVE frame decryption.
+		if voiceSpeakingUpdate.SSRC != 0 && voiceSpeakingUpdate.UserID != "" {
+			v.Lock()
+			v.daveSSRCToUserID[uint32(voiceSpeakingUpdate.SSRC)] = voiceSpeakingUpdate.UserID
+			v.Unlock()
+		}
+
+		if len(v.voiceSpeakingUpdateHandlers) == 0 {
+			return
+		}
+
 		for _, h := range v.voiceSpeakingUpdateHandlers {
 			h(v, voiceSpeakingUpdate)
 		}
+
+	case 11: // clients_connect — users joined the voice session
+		var data struct {
+			UserIDs []string `json:"user_ids"`
+		}
+		if err := json.Unmarshal(e.RawData, &data); err != nil {
+			v.log(LogError, "OP11 unmarshall error, %s, %s", err, string(e.RawData))
+			return
+		}
+		for _, uid := range data.UserIDs {
+			v.dave.AddUser(godave.UserID(uid))
+		}
+
+	case 13: // client_disconnect — a user left the voice session
+		var data struct {
+			UserID string `json:"user_id"`
+		}
+		if err := json.Unmarshal(e.RawData, &data); err != nil {
+			v.log(LogError, "OP13 unmarshall error, %s, %s", err, string(e.RawData))
+			return
+		}
+		v.dave.RemoveUser(godave.UserID(data.UserID))
+
+	case 21: // dave_protocol_prepare_transition
+		var data struct {
+			ProtocolVersion uint16 `json:"protocol_version"`
+			TransitionID    uint16 `json:"transition_id"`
+		}
+		if err := json.Unmarshal(e.RawData, &data); err != nil {
+			v.log(LogError, "OP21 unmarshall error, %s, %s", err, string(e.RawData))
+			return
+		}
+		v.dave.OnDavePrepareTransition(data.TransitionID, data.ProtocolVersion)
+
+	case 22: // dave_protocol_execute_transition
+		var data struct {
+			TransitionID uint16 `json:"transition_id"`
+		}
+		if err := json.Unmarshal(e.RawData, &data); err != nil {
+			v.log(LogError, "OP22 unmarshall error, %s, %s", err, string(e.RawData))
+			return
+		}
+		v.dave.OnDaveExecuteTransition(data.TransitionID)
+
+	case 24: // dave_protocol_prepare_epoch
+		var data struct {
+			ProtocolVersion uint16 `json:"protocol_version"`
+			Epoch           int    `json:"epoch"`
+		}
+		if err := json.Unmarshal(e.RawData, &data); err != nil {
+			v.log(LogError, "OP24 unmarshall error, %s, %s", err, string(e.RawData))
+			return
+		}
+		v.dave.OnDavePrepareEpoch(data.Epoch, data.ProtocolVersion)
 
 	default:
 		v.log(LogDebug, "unknown voice operation, %d, %s", e.Operation, string(e.RawData))
@@ -669,6 +760,9 @@ func (v *VoiceConnection) udpOpen() (err error) {
 		return
 	}
 
+	// Inform the DAVE session of the SSRC and codec for the local sender.
+	v.dave.AssignSsrcToCodec(v.op2.SSRC, godave.CodecOpus)
+
 	// start udpKeepAlive
 	go v.udpKeepAlive(v.udpConn, v.close, 5*time.Second)
 	// TODO: find a way to check that it fired off okay
@@ -736,6 +830,8 @@ func (v *VoiceConnection) opusSender(udpConn *net.UDPConn, close <-chan struct{}
 	var ok bool
 	udpHeader := make([]byte, 12)
 	nonce := make([]byte, 12)
+	// daveEncBuf is a reusable buffer for DAVE-encrypted frames.
+	daveEncBuf := make([]byte, 1400)
 
 	// build the parts that don't change in the udpHeader
 	udpHeader[0] = 0x80
@@ -765,6 +861,23 @@ func (v *VoiceConnection) opusSender(udpConn *net.UDPConn, close <-chan struct{}
 			err := v.Speaking(true)
 			if err != nil {
 				v.log(LogError, "error sending speaking packet, %s", err)
+			}
+		}
+
+		// DAVE end-to-end encrypt the Opus frame before transport encryption.
+		v.RLock()
+		dave := v.dave
+		v.RUnlock()
+		if dave != nil {
+			maxSize := dave.MaxEncryptedFrameSize(len(recvbuf))
+			if cap(daveEncBuf) < maxSize {
+				daveEncBuf = make([]byte, maxSize)
+			}
+			n, err := dave.Encrypt(v.op2.SSRC, recvbuf, daveEncBuf[:maxSize])
+			if err != nil {
+				v.log(LogError, "DAVE encrypt error, %s", err)
+			} else {
+				recvbuf = daveEncBuf[:n]
 			}
 		}
 
@@ -914,17 +1027,36 @@ func (v *VoiceConnection) opusReceiver(udpConn *net.UDPConn, close <-chan struct
 			continue
 		}
 		// AAD must cover the unencrypted header portion.
-		if plain, err := v.aead.Open(nil, nonce[:], cipherTextPayload, recvbuf[:aadLen]); err == nil {
-			// If header extensions are present, strip decrypted extension payload to get to Opus.
-			if extPayloadBytes > 0 {
-				if len(plain) < extPayloadBytes {
-					continue
-				}
-				plain = plain[extPayloadBytes:]
-			}
-			p.Opus = plain
-		} else {
+		plain, err := v.aead.Open(nil, nonce[:], cipherTextPayload, recvbuf[:aadLen])
+		if err != nil {
 			continue
+		}
+
+		// If header extensions are present, strip decrypted extension payload to get to Opus.
+		if extPayloadBytes > 0 {
+			if len(plain) < extPayloadBytes {
+				continue
+			}
+			plain = plain[extPayloadBytes:]
+		}
+
+		// DAVE end-to-end decrypt the frame after transport decryption.
+		v.RLock()
+		dave := v.dave
+		userID := v.daveSSRCToUserID[p.SSRC]
+		v.RUnlock()
+		if dave != nil {
+			daveUserID := godave.UserID(userID)
+			maxSize := dave.MaxDecryptedFrameSize(daveUserID, len(plain))
+			davePlain := make([]byte, maxSize)
+			n, daveErr := dave.Decrypt(daveUserID, plain, davePlain)
+			if daveErr != nil {
+				v.log(LogDebug, "DAVE decrypt error for ssrc %d: %s", p.SSRC, daveErr)
+				continue
+			}
+			p.Opus = davePlain[:n]
+		} else {
+			p.Opus = plain
 		}
 
 		if c != nil {
